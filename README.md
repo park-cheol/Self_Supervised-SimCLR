@@ -1,3 +1,8 @@
+ToDo
+- Multi GPU 지원
+- Resume, Valid set, Testset Code
+
+
 # A Simple Framework for Contrastive Learning of Visual Representations
 
 1. **Data Augmentation의 구성(Random Crop, Color Distortion)**
@@ -50,3 +55,12 @@
 - Projection Head는 Data transformation에 invariant 하도록 학습
 - 그래서 projectiion Head는 DownStream에 유용할 수 있는 정보를 제거할 수 있음
 - 결국 (a)에서 더 많은 정보들이 형성하고 유지할 수 있음.
+
+# Reference
+
+**paper: https://arxiv.org/abs/2002.05709**
+
+**참고한 Code:**
+
+**https://github.com/sthalles/SimCLR
+https://github.com/Spijkervet/SimCLR**
