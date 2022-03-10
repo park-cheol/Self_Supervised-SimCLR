@@ -7,12 +7,13 @@ class SimCLR(nn.Module):
 
     def __init__(self, encoder_name, out_dim):
         super(SimCLR, self).__init__()
+        self.out_dim = out_dim
 
         self.resnet_dict = {"resnet18": models.resnet18(pretrained=False, num_classes=out_dim),
                             "resnet50": models.resnet50(pretrained=False, num_classes=out_dim)}
         self.encoder = self.resnet_dict[encoder_name]
-        in_features = self.encoder.fc.in_features
-        self.proj_head = nn.Sequential(nn.Linear(in_features, in_features), # add Proj_Head
+        self.in_features = self.encoder.fc.in_features
+        self.proj_head = nn.Sequential(nn.Linear(self.in_features, self.in_features), # add Proj_Head
                                        nn.ReLU(),
                                        self.encoder.fc)
 

@@ -7,9 +7,9 @@ import datetime
 import time
 import warnings
 from enum import Enum
+from tqdm import tqdm
 
 from torch.utils.tensorboard import SummaryWriter
-from torch.cuda.amp import GradScaler, autocast
 
 import torch
 import torch.nn as nn
@@ -25,8 +25,10 @@ import torchvision.datasets as datasets
 import torchvision.models as models
 
 from models.SimCLR import SimCLR
+from models.logistic_regression import LogisticRegression
 from utils.accuracy import accuracy
-from utils.NT_Xent import NT_Xent
+from utils.utils import create_data_loaders_from_arrays
+from utils.inference import inference
 from data.transforms import Transforms
 
 
@@ -46,7 +48,7 @@ parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50',
                         ' (default: resnet50)')
 parser.add_argument('-j', '--workers', default=12, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
-parser.add_argument('--epochs', default=200, type=int, metavar='N',
+parser.add_argument('--epochs', default=500, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
@@ -65,8 +67,6 @@ parser.add_argument('-p', '--print-freq', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
-parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
-                    help='evaluate model on validation set')
 parser.add_argument('--out-dim', default=128, type=int)
 parser.add_argument('--temperature', default=0.07, type=float)
 
@@ -89,6 +89,7 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'N processes per node, which has N GPUs. This is the '
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
+best_acc1 = 0
 
 
 def main():
@@ -143,8 +144,15 @@ def main_worker(gpu, ngpus_per_node, args):
             args.rank = args.rank * ngpus_per_node + gpu
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                 world_size=args.world_size, rank=args.rank)
-    # create model
-    model = SimCLR(encoder_name=args.arch, out_dim=args.out_dim)
+    # Load SimCLR
+    simclr = SimCLR(encoder_name=args.arch, out_dim=args.out_dim).cuda(args.gpu)
+    loc = 'cuda:{}'.format(args.gpu)
+    checkpoint = torch.load(args.resume, map_location=loc)
+    simclr.load_state_dict(checkpoint['G_A2B'])
+    simclr.eval() # Freeze Weight
+
+    # create Model for linear evaluation
+    model = LogisticRegression(simclr.in_features, n_classes=10) # cifar-10 STL-10
 
     if not torch.cuda.is_available():
         print('using CPU, this will be slow')
@@ -183,13 +191,18 @@ def main_worker(gpu, ngpus_per_node, args):
     cudnn.benchmark = True
 
     if args.dataset_name == 'stl10':
-        data_transforms = Transforms(size=96)
-        train_dataset = datasets.STL10(args.data, split='unlabeled', transform=data_transforms,
+        data_transforms = Transforms(size=96).test_transform
+        train_dataset = datasets.STL10(args.data, split='train', transform=data_transforms,
                                        download=True)
+        test_dataset = datasets.STL10(args.data, split='test', transform=data_transforms,
+                                      download=True)
+
     elif args.dataset_name == 'cifar10':
-        data_transforms = Transforms(size=32)
+        data_transforms = Transforms(size=32).test_transform
         train_dataset = datasets.CIFAR10(args.data, train=True, transform=data_transforms,
                                          download=True)
+        test_dataset = datasets.CIFAR10(args.data, train=False, transform=data_transforms,
+                                        download=True)
     else:
         raise NotImplementedError
 
@@ -198,62 +211,103 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         train_sampler = None
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-                                               num_workers=args.workers, pin_memory=True, drop_last=True, sampler=train_sampler)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size,
+                                               shuffle=(train_sampler is None),
+                                               num_workers=args.workers, pin_memory=True, drop_last=True,
+                                               sampler=train_sampler)
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size,
+                                              shuffle=False,
+                                              num_workers=args.workers, pin_memory=True, drop_last=True)
 
     # define loss function (criterion) and optimizer
-    criterion = NT_Xent(batch_size=args.batch_size, temperature=args.temperature, world_size=args.world_size).cuda(args.gpu)
+    criterion = nn.CrossEntropyLoss().cuda(args.gpu)
     optimizer = torch.optim.Adam(model.parameters(), args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs, eta_min=0,
-                                                           last_epoch=-1)
 
-    # print Parameters
-    model_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print("Total Param: ", model_p)
+    print("Representation from Pretrained SimCLR")
+    train_x, train_y = inference(train_loader, simclr, args.gpu)
+    test_x, test_y = inference(test_loader, simclr, args.gpu)
+
+    arr_train_loader, arr_test_loader = create_data_loaders_from_arrays(train_x, train_y,
+                                                                        test_x, test_y,
+                                                                        args.batch_size)
 
     # Train
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
 
-        train(train_loader, model, criterion, optimizer, scheduler, epoch, args, summary)
+        train(arr_train_loader, model, criterion, optimizer, epoch, args, summary)
+        print("Testing")
+        acc1, acc5, loss = test(arr_test_loader, model, criterion, epoch, args, summary)
+        print(" Epoch [%d] | loss: %f | Acc@1: %f | Acc@5: %f |"
+              % (epoch + 1, loss, acc1, acc5))
+        if acc1 >= best_acc1:
+            print("Record Best Acc1")
+            best_acc1 = acc1
+    print("BEST ACC1 :", best_acc1)
 
-        if (epoch + 1) % 5 == 0 and (not args.multiprocessing_distributed or (args.multiprocessing_distributed
-                                                                        and args.rank % ngpus_per_node == 0)):
-            torch.save({
-                'epoch': epoch + 1,
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-            }, "saved_models/checkpoint_%d.pth" % (epoch + 1))
 
-
-def train(dataloader, model, criterion, optimizer, scheduler, epoch, args, summary):
+def train(dataloader, model, criterion, optimizer, epoch, args, summary):
     model.train()
 
-    for i, ((x_i, x_j), _) in enumerate(dataloader):
+    for i, (image, target) in enumerate(dataloader):
         start_time = time.time()
-        x_i, x_j = x_i.cuda(args.gpu, non_blocking=True), x_j.cuda(args.gpu, non_blocking=True),
-        h_i, h_j, z_i, z_j = model(x_i, x_j)
-        loss = criterion(z_i, z_j)
+        image = image.cuda(args.gpu, non_blocking=True)
+        target = target.cuda(args.gpu, non_blocking=True)
+
+        output = model(image)
+        loss = criterion(output, target)
+        acc1, acc5 = accuracy(output, target, topk=(1, 5))
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        # todo ?
+
         if dist.is_available() and dist.is_initialized():
             loss = loss.data.clone()
             dist.all_reduce(loss.div_(dist.get_world_size()))
 
         niter = epoch * len(dataloader) + i
         summary.add_scalar('Train/loss', loss.item(), niter)
+        summary.add_scalar('Train/acc1', acc1[0].item(), niter)
+        summary.add_scalar('Train/acc5', acc5[0].item(), niter)
 
         if i % args.print_freq == 0:
-            print(" Epoch [%d][%d/%d] | D_loss: %f |"
-                  % (epoch + 1, i, len(dataloader), loss))
+            print(" Epoch [%d][%d/%d] | loss: %f | Acc@1: %f | Acc@5: %f |"
+                  % (epoch + 1, i, len(dataloader), loss, acc1[0], acc5[0]))
 
-    scheduler.step()
     elapse = datetime.timedelta(seconds=time.time() - start_time)
     print(f"걸린 시간: ", elapse)
+
+
+def test(dataloader, model, criterion, epoch, args, summary):
+    loss_avg = 0
+    acc1_avg = 0
+    acc5_avg = 0
+    model.eval()
+
+    for i, (image, target) in tqdm(enumerate(dataloader)):
+        model.zero_grad()
+        image = image.cuda(args.gpu, non_blocking=True)
+        target = target.cuda(args.gpu, non_blocking=True)
+
+        output = model(image)
+        loss = criterion(output, target)
+
+        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        acc1_avg += acc1[0]
+        acc5_avg += acc5[0]
+        loss_avg += loss
+
+        niter = epoch * len(dataloader) + i
+        summary.add_scalar('Test/loss', loss.item(), niter)
+        summary.add_scalar('Test/acc1', acc1[0].item(), niter)
+        summary.add_scalar('Test/acc5', acc5[0].item(), niter)
+
+    summary.add_scalar('Test/avg_acc5', acc1_avg, epoch)
+    summary.add_scalar('Test/avg_acc5', acc5_avg, epoch)
+
+    return acc1_avg / len(dataloader), acc1_avg / len(dataloader), loss_avg / len(dataloader)
 
 
 if __name__ == "__main__":

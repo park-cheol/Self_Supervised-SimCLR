@@ -64,3 +64,10 @@ ToDo
 
 **https://github.com/sthalles/SimCLR
 https://github.com/Spijkervet/SimCLR**
+
+# Usage
+1. **Pretrain SimCLR**
+> python main.py --gpu 0 --world-size 1 --dataset-name ...
+
+2. **Linear Evaluation using pretrained SimCLR**
+> python linear_evaluatin.py --gpu 0 --world-size 1 --dataset-name ... --resume (model.pth)
