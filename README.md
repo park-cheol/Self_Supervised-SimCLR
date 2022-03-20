@@ -1,6 +1,5 @@
 ToDo
-- Multi GPU 지원
-- Resume, Valid set, Testset Code
+- code 확인
 
 
 # A Simple Framework for Contrastive Learning of Visual Representations
